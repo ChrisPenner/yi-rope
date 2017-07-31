@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# language UndecidableInstances #-}
 {-# OPTIONS_HADDOCK show-extensions #-}
 
 -- |
@@ -63,6 +64,7 @@ module Yi.Rope (
 
 
 import           Codec.Text.Detect (detectEncodingName)
+import           Control.Arrow (first, second)
 import           Control.DeepSeq
 import           Data.Binary
 import qualified Data.ByteString as BS
@@ -121,13 +123,32 @@ instance Monoid Size where
   mempty = Indices 0 0
   Indices c l `mappend` Indices c' l' = Indices (c + c') (l + l')
 
+newtype AnnText ann = AnnText (ann, YiChunk)
+  deriving (Show, Eq)
+
+getSize :: (v, Size) -> Size
+getSize = snd
+
+deAnnotate :: AnnText ann -> YiChunk
+deAnnotate (AnnText _ chunk) = chunk
+
 instance Measured Size YiChunk where
   measure (Chunk l t) = Indices l (countNl t)
 
+instance (Measured v a) => Measured (v, Size) (AnnText a) where
+  measure (AnnText ann chunk) = (measure ann, measure chunk)
+
 -- | A 'YiString' is a 'FingerTree' with cached column and line counts
 -- over chunks of 'TX.Text'.
-newtype YiString = YiString { fromRope :: FingerTree Size YiChunk }
-                 deriving (Show, Typeable)
+newtype YiString' v ann = YiString { fromRope' :: FingerTree (v, Size) (AnnText ann) }
+  deriving (Show, Typeable)
+type YiString = YiString' () ()
+
+fromRope :: YiString' v ann -> FingerTree Size YiChunk
+fromRope = fmap' deAnnotate
+
+withoutAnn :: (YiChunk -> YiChunk) -> AnnText ann -> AnnText ann
+withoutAnn f (AnnText (ann, chunk)) = AnnText (ann, f chunk)
 
 -- | Two 'YiString's are equal if their underlying text is.
 --
@@ -166,7 +187,7 @@ instance Ord YiString where
 instance Default YiString where
   def = mempty
 
-(-|) :: YiChunk -> FingerTree Size YiChunk -> FingerTree Size YiChunk
+(-|) :: AnnText ann -> FingerTree (v, Size) (AnnText ann) -> FingerTree (v, Size) (AnnText ann)
 b -| t | chunkSize b == 0 = t
        | otherwise        = b <| t
 
@@ -193,7 +214,7 @@ defaultChunkSize = 1200
 -- (but never more than the default size), perhaps we should
 -- periodically rechunk the tree to recover nice sizes?
 reverse :: YiString -> YiString
-reverse = YiString . fmap' (overChunk TX.reverse) . T.reverse . fromRope
+reverse = YiString . fmap' (overChunk TX.reverse) . T.reverse . fromRope'
 
 -- | See 'fromText'.
 fromString :: String -> YiString
@@ -237,12 +258,12 @@ fromText' n | n <= 0 = fromText' defaultChunkSize
 
 -- | Converts a 'TX.Text' into a 'YiString' using
 -- 'defaultChunkSize'-sized chunks for the underlying tree.
-fromText :: TX.Text -> YiString
+fromText :: TX.Text -> YiString' v ann
 fromText = fromText' defaultChunkSize
 
 -- | Consider whether you really need to use this!
-toText :: YiString -> TX.Text
-toText = TX.concat . go . fromRope
+toText :: YiString' v ann -> TX.Text
+toText = TX.concat . go . fromRope'
   where
     go :: FingerTree Size YiChunk -> [TX.Text]
     go t = case viewl t of
@@ -289,7 +310,7 @@ countNewLines = lineIndex . measure . fromRope
 --
 -- I suspect that this pays for itself as we'd spend more time
 -- computing over all the little chunks than few large ones anyway.
-append :: YiString -> YiString -> YiString
+append :: YiString' v ann -> YiString' v ann -> YiString' v ann
 append (YiString t) (YiString t') = case (viewr t, viewl t') of
   (EmptyR, _) -> YiString t'
   (_, EmptyL) -> YiString t
@@ -375,7 +396,7 @@ drop n = snd . Yi.Rope.splitAt n
 
 -- | The usual 'Prelude.dropWhile' optimised for 'YiString's.
 dropWhile :: (Char -> Bool) -> YiString -> YiString
-dropWhile p = YiString . go . fromRope
+dropWhile p = YiString . go . fromRope'
   where
     go t = case viewl t of
       EmptyL -> T.empty
@@ -401,7 +422,7 @@ dropWhile p = YiString . go . fromRope
 
 -- | As 'Yi.Rope.dropWhile' but drops from the end instead.
 dropWhileEnd :: (Char -> Bool) -> YiString -> YiString
-dropWhileEnd p = YiString . go . fromRope
+dropWhileEnd p = YiString . go . fromRope'
   where
     go t = case viewr t of
       EmptyR -> T.empty
@@ -417,7 +438,7 @@ dropWhileEnd p = YiString . go . fromRope
 
 -- | The usual 'Prelude.takeWhile' optimised for 'YiString's.
 takeWhile :: (Char -> Bool) -> YiString -> YiString
-takeWhile p = YiString . go . fromRope
+takeWhile p = YiString . go . fromRope'
   where
     go t = case viewl t of
       EmptyL -> T.empty
@@ -437,7 +458,7 @@ takeWhile p = YiString . go . fromRope
 
 -- | Like 'Yi.Rope.takeWhile' but takes from the end instead.
 takeWhileEnd :: (Char -> Bool) -> YiString -> YiString
-takeWhileEnd p = YiString . go . fromRope
+takeWhileEnd p = YiString . go . fromRope'
   where
     go t = case viewr t of
       EmptyR -> T.empty
@@ -547,7 +568,7 @@ splitAtLine n r | n <= 0    = (empty, r)
 -- The implementation is similar to that of 'splitAt' except we are
 -- now looking for extra newlines in the next chunk rather than extra
 -- characters.
-splitAtLine' :: Int -> YiString -> (YiString, YiString)
+splitAtLine' :: Int -> YiString' v ann -> (YiString' v ann, YiString' v ann)
 splitAtLine' p (YiString tr) = case viewl s of
   ch@(Chunk _ x) :< r ->
     let excess = lineIndex (measure f) + lineIndex (measure ch) - p - 1
@@ -556,7 +577,7 @@ splitAtLine' p (YiString tr) = case viewl s of
         YiString $ mkChunk TX.length rx -| r)
   _ -> (YiString f, YiString s)
   where
-    (f, s) = T.split ((p <) . lineIndex) tr
+    (f, s) = T.split ((p <) . lineIndex . getSize) tr
 
     cutExcess :: Int -> TX.Text -> (TX.Text, TX.Text)
     cutExcess n t = case TX.length t of
@@ -612,7 +633,7 @@ unlines = Yi.Rope.intersperse '\n'
 -- Implementation note: this currently just does any by doing ‘TX.Text’
 -- conversions upon consecutive chunks. We should be able to speed it
 -- up by running it in parallel over multiple chunks.
-any :: (Char -> Bool) -> YiString -> Bool
+any :: (Char -> Bool) -> YiString' v ann -> Bool
 any p = go . fromRope
   where
     go x = case viewl x of
@@ -622,7 +643,7 @@ any p = go . fromRope
 -- | 'YiString' specialised @all@.
 --
 -- See the implementation note for 'Yi.Rope.any'.
-all :: (Char -> Bool) -> YiString -> Bool
+all :: (Char -> Bool) -> YiString' v ann -> Bool
 all p = go . fromRope
   where
     go x = case viewl x of
@@ -732,20 +753,20 @@ detectEncoding err cs =
 --
 -- >>> filter (/= 'a') "bac"
 -- "bc"
-filter :: (Char -> Bool) -> YiString -> YiString
-filter p = YiString . go . fromRope
+filter :: (Char -> Bool) -> YiString' v ann -> YiString' v ann
+filter p = YiString . go . fromRope'
   where
     go t = case viewl t of
       EmptyL -> T.empty
-      Chunk _ x :< ts -> mkChunk TX.length (TX.filter p x) -| go ts
+      AnnText (ann, Chunk _ x) :< ts -> AnnText (ann, mkChunk TX.length (TX.filter p x)) -| go ts
 
 -- | Maps the characters over the underlying string.
-map :: (Char -> Char) -> YiString -> YiString
-map f = YiString . go . fromRope
+map :: (Char -> Char) -> YiString' ann v -> YiString' ann v
+map f = YiString . go . fromRope'
   where
     go t = case viewl t of
       EmptyL -> T.empty
-      Chunk l x :< ts -> Chunk l (TX.map f x) <| go ts
+      AnnText (ann, Chunk l x) :< ts -> AnnText (ann, Chunk l (TX.map f x)) <| go ts
 
 -- | Join given 'YiString's with a space. Empty lines will be filtered
 -- out first.
@@ -768,14 +789,14 @@ words = Prelude.filter (not . Yi.Rope.null) . Yi.Rope.split isSpace
 -- about as fast and in cases with lots of splits, faster, as a
 -- hand-rolled version on chunks with appends which is quite amazing
 -- in itself.
-split :: (Char -> Bool) -> YiString -> [YiString]
+split :: (Char -> Bool) -> YiString' v ann -> [YiString' v ann]
 split p = fmap fromText . TX.split p . toText
 
 -- | Left fold.
 --
 -- Benchmarks show that folding is actually Pretty Damn Slow™: consider
 -- whether folding is really the best thing to use in your scenario.
-foldl' :: (a -> Char -> a) -> a -> YiString -> a
+foldl' :: (a -> Char -> a) -> a -> YiString' v ann -> a
 foldl' f a = go a . fromRope
   where
     go acc t = case viewl t of
@@ -785,7 +806,7 @@ foldl' f a = go a . fromRope
 
 -- | Replicate the given YiString set number of times, concatenating
 -- the results. Also see 'Yi.Rope.replicateChar'.
-replicate :: Int -> YiString -> YiString
+replicate :: Int -> YiString' v ann -> YiString' v ann
 replicate n t | n <= 0 = mempty
               | otherwise = t <> Yi.Rope.replicate (n - 1) t
 
@@ -815,8 +836,8 @@ replicateChar n = fromText . TX.replicate n . TX.singleton
 -- @f x <> f y ≡ f (x <> y)@
 --
 -- which should look very familiar.
-withText :: (TX.Text -> TX.Text) -> YiString -> YiString
-withText f = YiString . T.fmap' (mkChunk TX.length . f . _fromChunk) . fromRope
+withText :: (TX.Text -> TX.Text) -> YiString' v ann -> YiString' v ann
+withText f = YiString . T.fmap' (withoutAnn (mkChunk TX.length . f . _fromChunk)) . fromRope'
 
 -- | Maps over each __chunk__ which means this function is UNSAFE! If
 -- you use this with functions which don't preserve 'Size', that is
@@ -824,7 +845,7 @@ withText f = YiString . T.fmap' (mkChunk TX.length . f . _fromChunk) . fromRope
 -- really badly. You should not need to use this.
 --
 -- Also see 'T.unsafeFmap'
-unsafeWithText :: (TX.Text -> TX.Text) -> YiString -> YiString
-unsafeWithText f = YiString . T.unsafeFmap g . fromRope
+unsafeWithText :: (TX.Text -> TX.Text) -> YiString' v ann -> YiString' v ann
+unsafeWithText f = YiString . T.unsafeFmap (withoutAnn g) . fromRope'
   where
     g (Chunk l t) = Chunk l (f t)
